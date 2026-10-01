@@ -215,6 +215,7 @@
   .chip.tone-unknown{ background:var(--v-bg-disabled); color:var(--v-text-secondary); }
   .chip.tone-local{ background:var(--v-bg-disabled); color:var(--v-text-secondary); }
   .chip.tone-gemini{ background:var(--v-indigo-selected); color:var(--v-indigo); }
+  .chip.tone-text{ background:var(--v-positive-selected); color:var(--v-positive); }
   .chip.tone-processing{ background:var(--v-warning-selected); color:var(--v-warning-text); }
   .chip.tone-error{ background:var(--v-negative-selected); color:var(--v-negative); }
   .row-tags{ display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-top:5px; }
@@ -490,7 +491,7 @@
             <svg class="ocr-mode-icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="2.5" y="3.5" width="15" height="10" rx="1.2" stroke="currentColor" stroke-width="1.4"/><path d="M7 17H13M10 13.5V17" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
             瀏覽器地端辨識
           </span>
-          <span class="ocr-mode-desc">完全離線，公文內容不會離開這台電腦。首次使用需下載語言模型。</span>
+          <span class="ocr-mode-desc">完全離線，公文內容不會離開這台電腦。PDF 本身帶有文字的頁面直接讀取，其餘頁面才做 OCR（首次需下載語言模型）。</span>
         </span>
       </label>
       <label class="ocr-mode-option">
@@ -671,7 +672,28 @@ const IS_INTERNAL_MEMO_RE = /簽第/;
 const OCR_METHOD_ICON = {
   local: '<svg class="chip-icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="2.5" y="3.5" width="15" height="10" rx="1.2" stroke="currentColor" stroke-width="1.6"/><path d="M7 17H13M10 13.5V17" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
   gemini: '<svg class="chip-icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6.5 15H14A3 3 0 0 0 14.5 9.06 4 4 0 0 0 6.7 7.2 3.2 3.2 0 0 0 6.5 15Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>',
+  text: '<svg class="chip-icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M5 2.5H12L15.5 6V17.5H5Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M8 9.5H12.5M8 12.5H12.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
 };
+
+// What actually produced a record's text. ocrMethod is the mode the user
+// picked; within local mode, pageSources says page by page whether the
+// PDF's own text layer was read or the page was OCR'd. Records from before
+// text-layer support have no pageSources and were OCR'd throughout.
+function textSourceOf(r){
+  if (r.ocrMethod === "gemini") {
+    return { tone: "gemini", icon: "gemini", chip: "Gemini", detail: "AI 雲端辨識（Gemini）" };
+  }
+  const sources = r.pageSources || [];
+  const textPages = sources.map((s, i) => s === "text" ? i + 1 : 0).filter(Boolean);
+  if (textPages.length && textPages.length === sources.length) {
+    return { tone: "text", icon: "text", chip: "文字層", detail: "PDF 內建文字（未經 OCR）" };
+  }
+  if (textPages.length) {
+    return { tone: "text", icon: "text", chip: "文字層＋本機",
+      detail: `混合：第 ${textPages.join("、")} 頁讀取 PDF 內建文字，其餘頁面瀏覽器地端辨識` };
+  }
+  return { tone: "local", icon: "local", chip: "本機", detail: "瀏覽器地端辨識" };
+}
 
 async function getWorker(){
   if (workerReady) return worker;
@@ -1370,8 +1392,9 @@ function renderTable(){
     const isDone = r.status === "done";
     let tagsHtml;
     if (isDone) {
+      const src = textSourceOf(r);
       tagsHtml = (r.meta.docType ? `<span class="chip tone-unknown">${escapeHtml(r.meta.docType)}</span>` : "")
-        + `<span class="chip tone-${r.ocrMethod === "gemini" ? "gemini" : "local"}">${OCR_METHOD_ICON[r.ocrMethod === "gemini" ? "gemini" : "local"]}${r.ocrMethod === "gemini" ? "Gemini" : "本機"}</span>`
+        + `<span class="chip tone-${src.tone}">${OCR_METHOD_ICON[src.icon]}${src.chip}</span>`
         + (r.metaEdited ? `<span class="muted" style="font-size:.72rem">內容已手動校正</span>` : "");
     } else if (r.status === "error") {
       tagsHtml = `<span class="chip tone-error">辨識失敗</span>`;
@@ -1442,7 +1465,7 @@ function renderDetailView(record){
   document.getElementById("detailModalSub").textContent =
     `共 ${record.pageCount} 頁 ・ 上傳於 ${new Date(record.uploadedAt).toLocaleString("zh-TW")}`;
   const fields = [
-    ["辨識方式", record.ocrMethod === "gemini" ? "AI 雲端辨識（Gemini）" : "瀏覽器地端辨識"],
+    ["辨識方式", textSourceOf(record).detail],
     ["文別", record.meta.docType],
     ["發文者", record.meta.agency],
     ["受文者", record.meta.recipient],
