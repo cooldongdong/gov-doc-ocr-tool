@@ -749,7 +749,23 @@ const FIELD_DEFS = [
 ];
 // Lines starting with these end whatever field was open, without becoming a
 // captured field themselves (so e.g. 正本/副本 don't get absorbed into 說明).
-const TERMINAL_RE = /^(?:正本|副本|承辦人|會辦|批示|檔號|保存年限|地址|聯絡人|聯絡方式|電話|電子郵件|機關全銜|上呈|敬陳|第\s*\d+\s*頁)/;
+const TERMINAL_RE = /^(?:正本|副本|承辦人|會辦|批示|檔號|保存年限|地址|聯絡人|聯絡方式|電話|電子郵件|機關全銜|上呈|敬陳)/;
+// A page footer ("第 1 頁 共 2 頁") is skipped rather than treated as a
+// terminator: it sits right before every page break, so ending the open
+// field there cut 說明/擬辦 off at the bottom of page 1 — defeating
+// CONTINUES_ACROSS_PAGES below. Skipping still keeps it out of the value.
+const PAGE_FOOTER_RE = /^第\s*\d+\s*頁/;
+// Joining a field's wrapped lines with a space suits English but splits
+// Chinese mid-phrase ("並將 檢測報告"). Glue CJK-to-CJK wraps directly —
+// unless the next line opens a new enumerated item (一、 / （二） / 3.),
+// where the space is what keeps the items apart once whitespace collapses.
+const CJK_EDGE_RE = /[\u3000-\u303f\u3400-\u9fff\uf900-\ufaff\uff00-\uffef]/;
+const ENUM_ITEM_RE = /^(?:[一二三四五六七八九十]+、|[（(][一二三四五六七八九十0-9０-９]+[)）]|[0-9０-９]+[.、．])/;
+function joinWrappedLine(value, line){
+  if (!value) return line;
+  if (CJK_EDGE_RE.test(value.slice(-1)) && CJK_EDGE_RE.test(line[0]) && !ENUM_ITEM_RE.test(line)) return value + line;
+  return value + " " + line;
+}
 // A short field (附件, 主旨, 速別…) should never run past the page it started
 // on — a page break almost always means "the attached document's own text
 // starts here", not "this field continues". 說明/擬辦 are the exception:
@@ -785,8 +801,9 @@ function parseFields(norm){
       out[key] = line.replace(re, "");
       continue;
     }
+    if (PAGE_FOOTER_RE.test(line)) continue;
     if (TERMINAL_RE.test(line)) { current = null; continue; }
-    if (current) out[current] = (out[current] || "") + " " + line;
+    if (current) out[current] = joinWrappedLine(out[current], line);
   }
   for (const k in out) out[k] = out[k].replace(/\s+/g, " ").trim();
   return out;
