@@ -690,20 +690,99 @@ async function getWorker(){
   return worker;
 }
 
-async function renderPdfPages(arrayBuffer){
+// Each page can be rendered (for Tesseract / Gemini) and/or have the PDF's
+// own embedded text read — lazily, because the local pipeline only needs
+// to render the pages whose text layer turns out not to be usable.
+async function loadPdfPages(arrayBuffer){
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-  const canvases = [];
+  const pages = [];
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const viewport = page.getViewport({ scale: 2.2 });
-    const canvas = document.createElement("canvas");
-    canvas.width = viewport.width;
-    canvas.height = viewport.height;
-    const ctx = canvas.getContext("2d");
-    await page.render({ canvasContext: ctx, viewport }).promise;
-    canvases.push(canvas);
+    pages.push({
+      height: viewport.height,
+      async render(){
+        const canvas = document.createElement("canvas");
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        const ctx = canvas.getContext("2d");
+        await page.render({ canvasContext: ctx, viewport }).promise;
+        return canvas;
+      },
+      readTextLayer: () => readTextLayer(page, viewport),
+    });
   }
+  return pages;
+}
+
+async function renderPdfPages(arrayBuffer){
+  const pages = await loadPdfPages(arrayBuffer);
+  const canvases = [];
+  for (const p of pages) canvases.push(await p.render());
   return canvases;
+}
+
+// Rebuilds the same shape Tesseract's recognize() hands back — { text,
+// lines[].text, lines[].bbox } in rendered-canvas pixels — so that
+// findTitleLineIndex() and extractMetadata() work on either source
+// unchanged. pdf.js only gives loose text runs (a string, a position, a
+// font size), not lines, so runs sharing a baseline are grouped back into
+// lines here. Font size comes straight from the PDF, which makes the
+// "letterhead is the visually biggest line" signal more reliable than the
+// OCR'd line heights it replaces.
+async function readTextLayer(page, viewport){
+  let content;
+  try { content = await page.getTextContent(); }
+  catch (e) { console.warn("text layer unreadable", e); return { text: "", lines: [] }; }
+  const runs = [];
+  for (const item of content.items) {
+    if (!item.str || !item.str.trim()) continue;
+    const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
+    const size = Math.hypot(tx[2], tx[3]);
+    if (!size) continue;
+    runs.push({ str: item.str, x0: tx[4], x1: tx[4] + item.width * viewport.scale, y: tx[5], size });
+  }
+  runs.sort((a, b) => a.y - b.y || a.x0 - b.x0);
+  const groups = [];
+  for (const r of runs) {
+    const g = groups[groups.length - 1];
+    if (g && Math.abs(r.y - g.y) < Math.min(r.size, g.size) * 0.5) g.runs.push(r);
+    else groups.push({ y: r.y, size: r.size, runs: [r] });
+  }
+  const lines = groups.map(g => {
+    g.runs.sort((a, b) => a.x0 - b.x0);
+    let text = "";
+    let prev = null;
+    for (const r of g.runs) {
+      // a visible horizontal gap means separate words/columns; CJK runs
+      // that merely got split by the PDF writer butt up against each other
+      if (prev && r.x0 - prev.x1 > r.size * 0.25) text += " ";
+      text += r.str;
+      prev = r;
+    }
+    const size = Math.max(...g.runs.map(r => r.size));
+    return {
+      text,
+      bbox: { x0: g.runs[0].x0, x1: Math.max(...g.runs.map(r => r.x1)), y0: g.y - size, y1: g.y },
+    };
+  });
+  return { text: lines.map(l => l.text).join("\n"), lines };
+}
+
+// Having a text layer doesn't mean it can be trusted: a font embedded
+// without a ToUnicode map comes out as Latin-1 mojibake, 造字 lands in the
+// Private Use Area, and a scan often carries nothing but a stamped page
+// number. A page that looks like any of those is OCR'd instead. (A text
+// layer that maps to the WRONG but perfectly ordinary CJK characters can't
+// be caught this cheaply — that one still needs a human eye.)
+const TEXT_LAYER_MIN_CHARS = 20;
+const TEXT_LAYER_MAX_SUSPICIOUS_RATIO = 0.05;
+const SUSPICIOUS_CHAR_RE = /[\u0001-\u0008\u000e-\u001f\u0080-ÿ-�]/g;
+function isTextLayerUsable(text){
+  const chars = (text || "").replace(/\s/g, "");
+  if (chars.length < TEXT_LAYER_MIN_CHARS) return false;
+  const suspicious = (chars.match(SUSPICIOUS_CHAR_RE) || []).length;
+  return suspicious / chars.length <= TEXT_LAYER_MAX_SUSPICIOUS_RATIO;
 }
 
 // --- 公文 metadata extraction -------------------------------------------------
@@ -922,9 +1001,13 @@ function extractMetadata(rawText, titleLineRaw, pageTitleLines){
 async function runOcrPipeline(record, fileBlob){
   try {
     const buf = await fileBlob.arrayBuffer();
-    const canvases = await renderPdfPages(buf);
-    record.pageCount = canvases.length;
-    const w = await getWorker();
+    const pages = await loadPdfPages(buf);
+    record.pageCount = pages.length;
+    // Decided page by page: a digitally issued cover letter with scanned
+    // attachments behind it is the common real-world mix. A usable text
+    // layer is the document's exact text — no misreads, and no need to
+    // download the OCR language model at all if every page has one.
+    const pageSources = [];
     let fullText = "";
     let titleLineRaw = "";
     // The same "line-height stands out from the page's body text" signal
@@ -933,13 +1016,22 @@ async function runOcrPipeline(record, fileBlob){
     // useful because the cover letter's 附件 line is very often just
     // "如說明" with the real title never spelled out there at all.
     const pageTitleLines = [];
-    for (let i = 0; i < canvases.length; i++) {
-      record.statusDetail = `辨識第 ${i + 1}/${canvases.length} 頁`;
+    for (let i = 0; i < pages.length; i++) {
+      record.statusDetail = `讀取第 ${i + 1}/${pages.length} 頁`;
       renderTable();
-      const { data } = await w.recognize(canvases[i]);
+      let data = await pages[i].readTextLayer();
+      if (isTextLayerUsable(data.text)) {
+        pageSources.push("text");
+      } else {
+        record.statusDetail = `辨識第 ${i + 1}/${pages.length} 頁`;
+        renderTable();
+        const w = await getWorker();
+        ({ data } = await w.recognize(await pages[i].render()));
+        pageSources.push("ocr");
+      }
       let pageTitle = "";
       if (data.lines && data.lines.length) {
-        const idx = findTitleLineIndex(data.lines, canvases[i].height);
+        const idx = findTitleLineIndex(data.lines, pages[i].height);
         if (idx >= 0) pageTitle = data.lines[idx].text;
       }
       if (i === 0) titleLineRaw = pageTitle;
@@ -949,6 +1041,7 @@ async function runOcrPipeline(record, fileBlob){
     }
     record.titleLineRaw = titleLineRaw;
     record.pageTitleLines = pageTitleLines;
+    record.pageSources = pageSources;
     record.ocrTextRaw = fullText.trim();
     record.ocrText = cleanOcrText(fullText).split(PAGE_BREAK).join("\n── 分頁 ──\n");
     record.meta = extractMetadata(record.ocrTextRaw, record.titleLineRaw, record.pageTitleLines);
