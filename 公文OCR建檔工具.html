@@ -757,14 +757,19 @@ const TERMINAL_RE = /^(?:正本|副本|承辦人|會辦|批示|檔號|保存年�
 const PAGE_FOOTER_RE = /^第\s*\d+\s*頁/;
 // Joining a field's wrapped lines with a space suits English but splits
 // Chinese mid-phrase ("並將 檢測報告"). Glue CJK-to-CJK wraps directly —
-// unless the next line opens a new enumerated item (一、 / （二） / 3.),
-// where the space is what keeps the items apart once whitespace collapses.
+// unless the line break is really a boundary between items, where the
+// space is what keeps them apart once whitespace collapses: the previous
+// line ends a sentence (…元整。 / 低收入…), or the next line opens a new
+// enumerated item (一、 / （二） / 3.) or a "label：value" line
+// (…上午十時 / 會議地點：…).
 const CJK_EDGE_RE = /[\u3000-\u303f\u3400-\u9fff\uf900-\ufaff\uff00-\uffef]/;
-const ENUM_ITEM_RE = /^(?:[一二三四五六七八九十]+、|[（(][一二三四五六七八九十0-9０-９]+[)）]|[0-9０-９]+[.、．])/;
+const SENTENCE_END_RE = /[。！？；：:!?;]$/;
+const ITEM_START_RE = /^(?:[一二三四五六七八九十]+、|[（(][一二三四五六七八九十0-9０-９]+[)）]|[0-9０-９]+[.、．]|[一-鿿]{2,6}[:：])/;
 function joinWrappedLine(value, line){
   if (!value) return line;
-  if (CJK_EDGE_RE.test(value.slice(-1)) && CJK_EDGE_RE.test(line[0]) && !ENUM_ITEM_RE.test(line)) return value + line;
-  return value + " " + line;
+  const isWrap = CJK_EDGE_RE.test(value.slice(-1)) && CJK_EDGE_RE.test(line[0])
+    && !SENTENCE_END_RE.test(value) && !ITEM_START_RE.test(line);
+  return isWrap ? value + line : value + " " + line;
 }
 // A short field (附件, 主旨, 速別…) should never run past the page it started
 // on — a page break almost always means "the attached document's own text
